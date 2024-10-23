@@ -185,7 +185,7 @@ config HOTPLUG_PCI_S390
 
 config HOTPLUG_PCI_PCIE_CRAY_E1000
 	bool "PCIe Hotplug extensions for Cray ClusterStor E1000"
-	depends on ACPI_PCI_SLOT && HOTPLUG_PCI_PCIE && IPMI_HANDLER=y
+	depends on HOTPLUG_PCI_PCIE && IPMI_HANDLER=y
 	help
 	  Say Y here if you have a Cray ClusterStor E1000 and want to control
 	  your NVMe slot LEDs.  Without this driver is it not possible

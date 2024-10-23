@@ -294,23 +294,22 @@ static int craye1k_send_message(struct craye1k *craye1k)
 static int craye1k_do_message(struct craye1k *craye1k)
 {
 	int rc;
-	long rc2;
 	struct completion *read_complete = &craye1k->read_complete;
 	unsigned long tout = msecs_to_jiffies(craye1k->completion_timeout_ms);
 
 	rc = craye1k_send_message(craye1k);
+	if (rc)
+		return rc;
+
+	rc = wait_for_completion_killable_timeout(read_complete, tout);
 	if (rc == 0) {
-		rc2 = wait_for_completion_killable_timeout(read_complete, tout);
-		if (rc2 == 0) {
-			craye1k->completion_timeout++;
-			rc = -ETIME;
-		}
+		/* timed out */
+		craye1k->completion_timeout++;
+		return -ETIME;
+
 	}
 
-	if (craye1k->rx_result == IPMI_UNKNOWN_ERR_COMPLETION_CODE || rc2 <= 0)
-		rc = -1;
-
-	return rc;
+	return 0;
 }
 
 /*
@@ -338,38 +337,10 @@ static int __craye1k_do_command(struct craye1k *craye1k, u8 netfn, u8 cmd,
 	}
 
 	rc = craye1k_do_message(craye1k);
-	memcpy(recv_data, craye1k->rx_msg_data, recv_data_len);
+	if (rc == 0)
+		memcpy(recv_data, craye1k->rx_msg_data, recv_data_len);
 
 	return rc;
-}
-
-/*
- * craye1k_do_command_and_netfn() - Do IPMI command and return 1st data byte
- *
- * Do an IPMI command with the given netfn, cmd, and optional send payload
- * bytes.
- *
- * Context: craye1k->lock is already held.
- * Returns: the last byte from the response or 0 if response had no response
- * data bytes, else -1 on error.
- */
-static int craye1k_do_command_and_netfn(struct craye1k *craye1k, u8 netfn,
-					u8 cmd, u8 *send_data, u8 send_data_len)
-{
-	int rc;
-
-	rc = __craye1k_do_command(craye1k, netfn, cmd, send_data, send_data_len,
-				  NULL, 0);
-	if (rc != 0) {
-		/* Error attempting command */
-		return -1;
-	}
-
-	if (craye1k->tx_msg.data_len == 0)
-		return 0;
-
-	/* Return last received byte value */
-	return craye1k->rx_msg_data[craye1k->rx_msg_len - 1];
 }
 
 /*
@@ -385,8 +356,20 @@ static int craye1k_do_command_and_netfn(struct craye1k *craye1k, u8 netfn,
 static int craye1k_do_command(struct craye1k *craye1k, u8 cmd, u8 *send_data,
 			      u8 send_data_len)
 {
-	return (craye1k_do_command_and_netfn(craye1k, CRAYE1K_CMD_NETFN, cmd,
-					     send_data, send_data_len));
+	int rc;
+
+	rc = __craye1k_do_command(craye1k, CRAYE1K_CMD_NETFN, cmd, send_data,
+				  send_data_len, NULL, 0);
+	if (rc != 0) {
+		/* Error attempting command */
+		return -1;
+	}
+
+	if (craye1k->tx_msg.data_len == 0)
+		return 0;
+
+	/* Return last received byte value */
+	return craye1k->rx_msg_data[craye1k->rx_msg_len - 1];
 }
 
 /*
@@ -409,9 +392,9 @@ static int __craye1k_set_primary(struct craye1k *craye1k)
 /*
  * craye1k_is_primary() - Are we the primary server?
  *
- * Returns: 1 if we are the primary server, 0 otherwise.
+ * Returns: true if we are the primary server, false otherwise.
  */
-static int craye1k_is_primary(struct craye1k *craye1k)
+static bool craye1k_is_primary(struct craye1k *craye1k)
 {
 	u8 byte = 0;
 	int rc;
@@ -420,16 +403,16 @@ static int craye1k_is_primary(struct craye1k *craye1k)
 	rc = craye1k_do_command(craye1k, CRAYE1K_CMD_PRIMARY, &byte, 1);
 	craye1k->check_primary++;
 	if (rc == 0x1)
-		return 1;   /* success */
+		return true;   /* success */
 
 	craye1k->check_primary_failed++;
-	return 0;   /* We are not the primary server node */
+	return false;   /* We are not the primary server node */
 }
 
 /*
  * craye1k_set_primary() - Attempt to set ourselves as the primary server
  *
- * Returns: 0 on success, 1 otherwise.
+ * Returns: 0 on success, -1 otherwise.
  */
 static int craye1k_set_primary(struct craye1k *craye1k)
 {
@@ -446,7 +429,7 @@ static int craye1k_set_primary(struct craye1k *craye1k)
 
 	if (__craye1k_set_primary(craye1k) != 0) {
 		craye1k->set_initial_primary_failed++;
-		return 1;	/* error */
+		return -1;	/* error */
 	}
 
 	/*
@@ -461,7 +444,7 @@ static int craye1k_set_primary(struct craye1k *craye1k)
 
 	if (tries == 0) {
 		craye1k->set_primary_failed++;
-		return 1;	/* never reported that it's primary */
+		return -1;	/* never reported that it's primary */
 	}
 
 	/* Wait for primary switch to finish */
