@@ -17,8 +17,8 @@
 
 #include <linux/debugfs.h>
 #include <linux/delay.h>
-#include <linux/errno.h>
 #include <linux/dmi.h>
+#include <linux/errno.h>
 #include <linux/ipmi.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -99,8 +99,13 @@ struct craye1k {
  * impossible to instantiate more than one craye1k.
  */
 static struct craye1k *craye1k_global;
+static DEFINE_MUTEX(craye1k_lock);
 
-/* Return parent dir dentry */
+/*
+ * The E1000 command timeout and retry values were found though experimentation
+ * by looking at the error counters.  Keep the counters around to troubleshoot
+ * any issues with our current timeout/retry values.
+ */
 static struct dentry *
 craye1k_debugfs_init(struct craye1k *craye1k)
 {
@@ -150,6 +155,7 @@ craye1k_debugfs_init(struct craye1k *craye1k)
 	debugfs_create_bool("print_errors", mode, parent,
 			    &craye1k->print_errors);
 
+	/* Return parent dir dentry */
 	return parent;
 }
 
@@ -163,9 +169,9 @@ static void craye1k_msg_handler(struct ipmi_recv_msg *msg, void *user_msg_data)
 	if (msg->msgid != craye1k->tx_msg_id) {
 		craye1k->wrong_msgid++;
 		if (craye1k->print_errors) {
-			dev_warn_ratelimited(craye1k->dev, "rx msgid %d != %d",
-					     (int)msg->msgid,
-					     (int)craye1k->tx_msg_id);
+			dev_warn_ratelimited(craye1k->dev,
+					     "rx msgid %ld != %ld",
+					     msg->msgid, craye1k->tx_msg_id);
 		}
 		ipmi_free_recv_msg(msg);
 		return;
@@ -200,9 +206,6 @@ static void craye1k_new_smi(int iface, struct device *dev)
 	int rc;
 	struct craye1k *craye1k;
 
-	/* There's only one node controller so driver data should not be set */
-	WARN_ON(craye1k_global);
-
 	craye1k = kzalloc(sizeof(*craye1k), GFP_KERNEL);
 	if (!craye1k)
 		return;
@@ -217,7 +220,6 @@ static void craye1k_new_smi(int iface, struct device *dev)
 	craye1k->completion_timeout_ms = 300;
 
 	init_completion(&craye1k->read_complete);
-	mutex_init(&craye1k->lock);
 
 	dev_set_drvdata(dev, craye1k);
 
@@ -231,9 +233,14 @@ static void craye1k_new_smi(int iface, struct device *dev)
 		return;
 	}
 
-	craye1k_global = craye1k;
+	mutex_lock(&craye1k_lock);
 
+	/* There's only one node controller so driver data should not be set */
+	WARN_ON(craye1k_global);
+
+	craye1k_global = craye1k;
 	craye1k->parent = craye1k_debugfs_init(craye1k);
+	mutex_unlock(&craye1k_lock);
 	if (!craye1k->parent)
 		dev_warn(dev, "Cannot create debugfs");
 
@@ -243,6 +250,14 @@ static void craye1k_new_smi(int iface, struct device *dev)
 static void craye1k_smi_gone(int iface)
 {
 	pr_warn("craye1k: Got unexpected smi_gone, iface=%d", iface);
+
+	mutex_lock(&craye1k_lock);
+	if (craye1k_global) {
+		debugfs_remove_recursive(craye1k_global->parent);
+		kfree(craye1k_global);
+		craye1k_global = NULL;
+	}
+	mutex_unlock(&craye1k_lock);
 }
 
 static struct ipmi_smi_watcher craye1k_smi_watcher = {
@@ -254,7 +269,7 @@ static struct ipmi_smi_watcher craye1k_smi_watcher = {
 /*
  * craye1k_send_message() - Send the message already setup in 'craye1k'
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Return: 0 on success, non-zero on error.
  */
 static int craye1k_send_message(struct craye1k *craye1k)
@@ -286,7 +301,7 @@ static int craye1k_send_message(struct craye1k *craye1k)
 /*
  * craye1k_do_message() - Send the message in 'craye1k' and wait for a response
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Return: 0 on success, non-zero on error.
  */
 static int craye1k_do_message(struct craye1k *craye1k)
@@ -295,7 +310,7 @@ static int craye1k_do_message(struct craye1k *craye1k)
 	struct completion *read_complete = &craye1k->read_complete;
 	unsigned long tout = msecs_to_jiffies(craye1k->completion_timeout_ms);
 
-	WARN_ON(!mutex_is_locked(&craye1k->lock));
+	WARN_ON(!mutex_is_locked(&craye1k_lock));
 
 	rc = craye1k_send_message(craye1k);
 	if (rc)
@@ -316,7 +331,7 @@ static int craye1k_do_message(struct craye1k *craye1k)
  *
  * Send a command with optional data bytes, and read back response bytes.
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: 0 on success, non-zero on error.
  */
 static int __craye1k_do_command(struct craye1k *craye1k, u8 netfn, u8 cmd,
@@ -349,7 +364,7 @@ static int __craye1k_do_command(struct craye1k *craye1k, u8 netfn, u8 cmd,
  * @send_data:  Data to send after the command
  * @send_data_len: Data length
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: the last byte from the response or 0 if response had no response
  * data bytes, else -1 on error.
  */
@@ -379,7 +394,7 @@ static int craye1k_do_command(struct craye1k *craye1k, u8 cmd, u8 *send_data,
  * NVMe LED, this server needs to first tell the BMC that it's the primary
  * server.
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: 0 on success, non-zero on error.
  */
 static int __craye1k_set_primary(struct craye1k *craye1k)
@@ -393,7 +408,7 @@ static int __craye1k_set_primary(struct craye1k *craye1k)
 /*
  * craye1k_is_primary() - Are we the primary server?
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: true if we are the primary server, false otherwise.
  */
 static bool craye1k_is_primary(struct craye1k *craye1k)
@@ -414,7 +429,7 @@ static bool craye1k_is_primary(struct craye1k *craye1k)
 /*
  * craye1k_set_primary() - Attempt to set ourselves as the primary server
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: 0 on success, -1 otherwise.
  */
 static int craye1k_set_primary(struct craye1k *craye1k)
@@ -461,7 +476,7 @@ static int craye1k_set_primary(struct craye1k *craye1k)
  * @slot: Slot number (1-24)
  * @is_locate_led: 0 = get fault LED value, 1 = get locate LED value
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: slot value on success, -1 on failure.
  */
 static int craye1k_get_slot_led(struct craye1k *craye1k, unsigned char slot,
@@ -487,7 +502,7 @@ static int craye1k_get_slot_led(struct craye1k *craye1k, unsigned char slot,
  * Check the LED value after calling this function to ensure it has been set
  * properly.
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: 0 on success, non-zero on failure.
  */
 static int craye1k_set_slot_led(struct craye1k *craye1k, unsigned char slot,
@@ -509,7 +524,7 @@ static int craye1k_set_slot_led(struct craye1k *craye1k, unsigned char slot,
 /*
  * __craye1k_get_attention_status() - Get LED value
  *
- * Context: craye1k->lock is already held.
+ * Context: craye1k_lock is already held.
  * Returns: 0 on success, -EIO on failure.
  */
 static int __craye1k_get_attention_status(struct hotplug_slot *hotplug_slot,
@@ -554,14 +569,20 @@ int craye1k_get_attention_status(struct hotplug_slot *hotplug_slot,
 	int rc;
 	struct craye1k *craye1k;
 
-	craye1k = craye1k_global;
-
-	if (mutex_lock_interruptible(&craye1k->lock) != 0)
+	if (mutex_lock_interruptible(&craye1k_lock) != 0)
 		return -EINTR;
+
+	if (!craye1k_global) {
+		/* Driver isn't initialized yet */
+		mutex_unlock(&craye1k_lock);
+		return -EOPNOTSUPP;
+	}
+
+	craye1k = craye1k_global;
 
 	rc =  __craye1k_get_attention_status(hotplug_slot, status, true);
 
-	mutex_unlock(&craye1k->lock);
+	mutex_unlock(&craye1k_lock);
 	return rc;
 }
 
@@ -575,12 +596,18 @@ int craye1k_set_attention_status(struct hotplug_slot *hotplug_slot,
 	struct craye1k *craye1k;
 	bool locate, fault;
 
+	if (mutex_lock_interruptible(&craye1k_lock) != 0)
+		return -EINTR;
+
+	if (!craye1k_global) {
+		/* Driver isn't initialized yet */
+		mutex_unlock(&craye1k_lock);
+		return -EOPNOTSUPP;
+	}
+
 	craye1k = craye1k_global;
 
 	slot = PSN(to_ctrl(hotplug_slot));
-
-	if (mutex_lock_interruptible(&craye1k->lock) != 0)
-		return -EINTR;
 
 	/* Retry to ensure all LEDs are set */
 	while (tries--) {
@@ -639,7 +666,7 @@ int craye1k_set_attention_status(struct hotplug_slot *hotplug_slot,
 		 */
 		msleep(500 + (get_random_long() % 500));
 	}
-	mutex_unlock(&craye1k->lock);
+	mutex_unlock(&craye1k_lock);
 	if (tries == 0) {
 		craye1k->set_led_failed++;
 		return -EIO;
@@ -648,21 +675,13 @@ int craye1k_set_attention_status(struct hotplug_slot *hotplug_slot,
 	return 0;
 }
 
-static bool is_craye1k_board(void)
+bool is_craye1k_board(void)
 {
 	return dmi_match(DMI_PRODUCT_NAME, "VSSEP1EC");
 }
 
-bool is_craye1k_slot(struct controller *ctrl)
-{
-	return (PSN(ctrl) >= 1 && PSN(ctrl) <= 24 && is_craye1k_board());
-}
-
 int craye1k_init(void)
 {
-	if (!is_craye1k_board())
-		return 0;
-
 	return ipmi_smi_watcher_register(&craye1k_smi_watcher);
 }
 

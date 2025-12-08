@@ -72,14 +72,23 @@ static int init_slot(struct controller *ctrl)
 	} else if (ctrl->pcie->port->hotplug_user_indicators) {
 		ops->get_attention_status = pciehp_get_raw_indicator_status;
 		ops->set_attention_status = pciehp_set_raw_indicator_status;
-	}
-#ifdef CONFIG_HOTPLUG_PCI_PCIE_CRAY_E1000
-	if (is_craye1k_slot(ctrl)) {
-		/* slots 1-24 on Cray E1000s are controlled differently */
+	} else if (is_craye1k_slot(ctrl)) {
+		/*
+		 * The Cray E1000 driver controls slots 1-24.  Initialize the
+		 * Cray E1000 driver when slot 1 is seen.
+		 */
+		if (PSN(ctrl) == 1) {
+			retval = craye1k_init();
+			if (retval) {
+				ctrl_err(ctrl,
+					 "Error loading Cray E1000 extensions");
+				kfree(ops);
+				return retval;
+			}
+		}
 		ops->get_attention_status = craye1k_get_attention_status;
 		ops->set_attention_status = craye1k_set_attention_status;
 	}
-#endif
 
 	/* register this slot with the hotplug pci core */
 	ctrl->hotplug_slot.ops = ops;
@@ -387,12 +396,6 @@ int __init pcie_hp_init(void)
 		pr_debug("Failure to register service\n");
 		return retval;
 	}
-
-#ifdef CONFIG_HOTPLUG_PCI_PCIE_CRAY_E1000
-	retval = craye1k_init();
-	if (retval)
-		pr_debug("Failure to register Cray E1000 extensions");
-#endif
 
 	return retval;
 }

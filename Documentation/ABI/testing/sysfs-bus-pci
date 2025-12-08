@@ -242,9 +242,9 @@ Description:
 		Common values:
 		0 = OFF
 		1 = ON
-		2 = blink (ampere, ibmphp, pciehp, rpaphp, shpchp)
+		2 = blink
 
-		Using the pciehp_craye1k extensions:
+		Using the Cray ClusterStor E1000 extensions:
 		0 = fault LED OFF, locate LED OFF
 		1 = fault LED ON,  locate LED OFF
 		2 = fault LED OFF, locate LED ON
